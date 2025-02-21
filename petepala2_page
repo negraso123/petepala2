@@ -1,0 +1,282 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "esp_http_server.h"
+
+// Configuración de Wi-Fi
+const char* ssid = "CESJT";       // Cambia esto por tu SSID
+const char* password = "itisjtsmg"; // Cambia esto por tu contraseña
+
+// Pines de la cámara AI Thinker
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+httpd_handle_t stream_httpd = NULL;
+
+// Handler para el streaming de video
+static esp_err_t capture_handler(httpd_req_t *req) {
+  camera_fb_t * fb = esp_camera_fb_get();  // Capturar una imagen
+  if (!fb) {
+    //Serial.println("Error: Captura de imagen fallida");
+    return httpd_resp_send_500(req);  // Responder con error
+  }
+
+  esp_err_t res = ESP_OK;
+
+  // Comprobar si la imagen está en formato JPEG
+  if (fb->format != PIXFORMAT_JPEG) {
+    uint8_t * jpg_buf = NULL;
+    size_t jpg_buf_len = 0;
+    bool jpeg_converted = frame2jpg(fb, 80, &jpg_buf, &jpg_buf_len);
+    esp_camera_fb_return(fb);  // Liberar la imagen original
+
+    if (!jpeg_converted) {
+      //Serial.println("Error: Fallo en la conversión a JPEG");
+      return httpd_resp_send_500(req);  // Responder con error
+    }
+
+    // Enviar la imagen convertida
+    httpd_resp_set_type(req, "image/jpeg");
+    res = httpd_resp_send(req, (const char *)jpg_buf, jpg_buf_len);
+    free(jpg_buf);  // Liberar memoria de la imagen JPEG
+  } else {
+    // Enviar directamente la imagen JPEG capturada
+    httpd_resp_set_type(req, "image/jpeg");
+    res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+    esp_camera_fb_return(fb);  // Liberar la imagen capturada
+  }
+  return res;
+}
+static esp_err_t command_handler(httpd_req_t *req) {
+  char content[100];
+  int ret = httpd_req_recv(req, content, req->content_len);
+  if (ret <= 0) {
+    return ESP_FAIL;
+  }
+
+  // Parsear el comando recibido
+  content[ret] = '\0'; // Agregar terminador nulo
+  String command = String(content);
+  if (command.indexOf("cmd=") >= 0) {
+    String value = command.substring(command.indexOf("cmd=") + 4);
+    Serial.println(value.c_str());
+  }
+  // Responder al cliente
+  httpd_resp_send(req, "Comando recibido", HTTPD_RESP_USE_STRLEN);
+  return ESP_OK;
+}
+
+// Handler para la página web
+static esp_err_t index_handler(httpd_req_t *req) {
+  const char* html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Interfaz PetPal</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css">
+  <style>
+    body { font-family: Arial, sans-serif; background-color: #d2b48c; color: #3c2f2f; }
+    header { display: flex; justify-content: space-between; align-items: center; background-color: #8b4513; padding: 10px 20px; }
+    .logo { font-size: 2rem; }
+    .nav-link { color: #f5deb3; text-decoration: none; margin-left: 20px; font-size: 1rem; }
+    main { display: flex; justify-content: space-around; align-items: center; padding: 50px 20px; }
+    .sensor-container { display: flex; flex-direction: column; align-items: center; }
+    .sensor-label { font-size: 1.5rem; font-weight: bold; margin-bottom: 10px; text-align: center; }
+    .sensor-bar { width: 50px; height: 300px; background-color: #f5deb3; border-radius: 25px; position: relative; cursor: pointer; transition: transform 0.2s; }
+    .sensor-bar:hover { transform: scale(1.05); }
+    .camera-container { display: flex; flex-direction: column; align-items: center; }
+    .camera-container p { font-size: 1.2rem; margin-bottom: 10px; }
+    .camera { width: 400px; height: 250px; border: 5px solid #3c2f2f; }
+    footer { display: flex; justify-content: space-around; padding: 20px; }
+    .button { width: 80px; height: 80px; background-color: #f5deb3; border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: transform 0.2s; }
+    .button:hover { transform: scale(1.1); }
+    .icon { font-size: 2rem; color: #3c2f2f; }
+    .cam-button { width: 400px; height: 50px; background-color: #f5deb3; border-radius: 25px; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: transform 0.2s; border: none; margin-top: 10px;}
+    .cam-button:hover { transform: scale(1.05); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="logo">🐾</div>
+    <nav>
+      <a href="ayuda.docx" class="nav-link">Ayuda</a>
+      <a href="preguntas.docx" class="nav-link">Preguntas frecuentes</a>
+    </nav>
+  </header>
+
+  <main>
+    <div class="sensor-container izquierda">
+      <div class="sensor-label">AGUA</div>
+      <div class="sensor-bar"></div>
+    </div>
+
+    <div class="camera-container">
+      <p>Tu mascota está en "Habitación 1"</p>
+      <img id="capturedImage" class="camera">
+    <button class="cam-button" onclick="captureImage()"><i class="fas fa-camera icon"></i></button>
+    </div>
+
+    <div class="sensor-container derecha">
+      <div class="sensor-label">COMIDA</div>
+      <div class="sensor-bar"></div>
+    </div>
+  </main>
+
+  <footer>
+    <div class="button" data-command="1"><i class="fas fa-ban icon"></i></div>
+    <div class="button" data-command="2"><i class="fas fa-gift icon"></i></div>
+    <div class="button" data-command="3"><i class="fas fa-bone icon"></i></div>
+    <div class="button" data-command="4"><i class="fas fa-music icon"></i></div>
+    <div class="button" data-command="5"><i class="fas fa-volume-mute icon"></i></div>
+  </footer>
+  <script>
+    document.querySelectorAll('.button').forEach(button => {
+      button.addEventListener('click', () => {
+        const command = button.getAttribute('data-command');
+        fetch('/command', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: `cmd=${command}`
+        })
+        .then(response => {
+          if (response.ok) {
+            console.log(`${command} enviado correctamente`);
+          } else {
+            console.error('Error al enviar el comando');
+          }
+        });
+      });
+    });
+
+    function captureImage() {
+      fetch('/capture')
+        .then(response => {
+          if (!response.ok) throw new Error('Fallo en la captura');
+          return response.blob(); // Obtener la imagen como un blob
+        })
+        .then(blob => {
+          const url = URL.createObjectURL(blob);
+          const img = document.getElementById('capturedImage');
+          img.src = url;  // Mostrar la imagen capturada
+        })
+        .catch(error => console.error('Error:', error));
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+  return httpd_resp_send(req, html, strlen(html));
+}
+
+// Inicia el servidor de la cámara
+void startCameraServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+
+  httpd_uri_t command_uri = {
+    .uri       = "/command",
+    .method    = HTTP_POST,
+    .handler   = command_handler,
+    .user_ctx  = NULL
+  };
+  
+  httpd_uri_t capture_uri = {
+    .uri       = "/capture",
+    .method    = HTTP_GET,
+    .handler   = capture_handler,
+    .user_ctx  = NULL
+  };
+
+  httpd_uri_t index_uri = {
+    .uri       = "/",
+    .method    = HTTP_GET,
+    .handler   = index_handler,
+    .user_ctx  = NULL
+  };
+
+  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd, &capture_uri);
+    httpd_register_uri_handler(stream_httpd, &index_uri);
+    httpd_register_uri_handler(stream_httpd, &command_uri);
+  }
+}
+
+void setup() {
+  // Deshabilitar detector de brownout
+//  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  
+  Serial.begin(9600);
+  Serial.println("Inicializando...");
+
+  // Configuración de la cámara
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_QVGA; // Baja resolución para estabilidad
+  config.jpeg_quality = 12;           // Calidad media
+  config.fb_count = 1;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Error al inicializar la cámara: 0x%x\n", err);
+    ESP.restart();
+  }
+
+  // Conexión Wi-Fi
+  WiFi.begin(ssid, password);
+  unsigned long startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Error al conectar a Wi-Fi. Reiniciando...");
+    ESP.restart();
+  }
+
+  Serial.println();
+  Serial.print("Conectado a Wi-Fi, IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Iniciar servidor de cámara
+  startCameraServer();
+  Serial.println("Servidor de cámara iniciado.");
+}
+
+void loop() {
+  delay(1);
+}
